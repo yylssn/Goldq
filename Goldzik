@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Złoto: panel</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  body { margin:0; font-family:Arial,sans-serif; background:#0f1419; color:#e6e6e6; }
+  header { padding:12px 16px; background:#151b23; border-bottom:1px solid #2a3340; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0 12px 0 0; }
+  button { background:#1d2631; color:#e6e6e6; border:1px solid #2a3340; padding:10px 16px; border-radius:6px; cursor:pointer; font-size:15px; }
+  button.active { background:#2f6feb; border-color:#2f6feb; }
+  #price { margin-left:auto; font-size:18px; font-weight:bold; }
+  #chart { width:100%; height:480px; }
+  .box { background:#151b23; border:1px solid #2a3340; border-radius:8px; padding:12px 16px; margin:12px 16px; line-height:1.6; }
+  .up { color:#26a69a; } .down { color:#ef5350; } .side { color:#f0b90b; }
+  small { color:#8b97a6; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Złoto XAUUSD</h1>
+  <button data-tf="1d">D1</button>
+  <button data-tf="4h">H4</button>
+  <button data-tf="1h" class="active">H1</button>
+  <span id="price">...</span>
+</header>
+<div id="chart"></div>
+<div id="status" class="box">Ładowanie danych...</div>
+<div id="plan" class="box"></div>
+
+<script>
+var SYMBOL = 'XAUUSD';
+var BASE = 'https://biquote.io/api/' + SYMBOL + '/ohlc';
+var tf = '1h';
+var candles = [];
+
+// ---------- wykres ----------
+var el = document.getElementById('chart');
+var chart = LightweightCharts.createChart(el, {
+  layout: { background: { color: '#0f1419' }, textColor: '#e6e6e6' },
+  grid: { vertLines: { color: '#1d2631' }, horzLines: { color: '#1d2631' } },
+  timeScale: { timeVisible: true, secondsVisible: false },
+  width: el.clientWidth, height: 480
+});
+var series = chart.addCandlestickSeries({
+  upColor: '#26a69a', downColor: '#ef5350',
+  wickUpColor: '#26a69a', wickDownColor: '#ef5350', borderVisible: false
+});
+var ma20 = chart.addLineSeries({ color: '#f0b90b', lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
+var ma50 = chart.addLineSeries({ color: '#2f6feb', lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
+window.addEventListener('resize', function () { chart.applyOptions({ width: el.clientWidth }); });
+
+// ---------- pobieranie ----------
+function toCandle(b) {
+  return { time: Math.floor(new Date(b.openTime).getTime() / 1000), open: b.open, high: b.high, low: b.low, close: b.close };
+}
+
+async function getBars(interval, params) {
+  var url = BASE + '?interval=' + interval + params;
+  var res = await fetch(url);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  var json = await res.json();
+  return json.bars.map(toCandle);
+}
+
+// dwa miesiące: D1 ok. 60 świec, H4 ok. 360, H1 ok. 1400 (dwa zapytania)
+async function loadHistory() {
+  var now = new Date();
+  var from = new Date(now.getTime() - 62 * 24 * 3600 * 1000).toISOString();
+  var bars;
+  if (tf === '1h') {
+    var mid = new Date(now.getTime() - 31 * 24 * 3600 * 1000).toISOString();
+    var a = await getBars(tf, '&limit=1000&from=' + from + '&to=' + mid);
+    var b = await getBars(tf, '&limit=1000&from=' + mid);
+    bars = a.concat(b);
+  } else {
+    bars = await getBars(tf, '&limit=1000&from=' + from);
+  }
+  var seen = {}, out = [];
+  bars.sort(function (x, y) { return x.time - y.time; });
+  bars.forEach(function (c) { if (!seen[c.time]) { seen[c.time] = 1; out.push(c); } });
+  return out;
+}
+
+// ---------- wskaźniki ----------
+function sma(data, period) {
+  var out = [];
+  for (var i = period - 1; i < data.length; i++) {
+    var s = 0;
+    for (var j = i - period + 1; j <= i; j++) s += data[j].close;
+    out.push({ time: data[i].time, value: s / period });
+  }
+  return out;
+}
+
+function atr(data, period) {
+  var sum = 0, n = 0;
+  for (var i = data.length - period; i < data.length; i++) {
+    if (i < 1) continue;
+    var d = data[i], p = data[i - 1];
+    sum += Math.max(d.high - d.low, Math.abs(d.high - p.close), Math.abs(d.low - p.close));
+    n++;
+  }
+  return n ? sum / n : 0;
+}
+
+// ---------- fair value gapy (tylko niewypełnione) ----------
+function findFVGs(data) {
+  var gaps = [];
+  for (var i = 2; i < data.length; i++) {
+    var a = data[i - 2], c = data[i];
+    if (c.low > a.high) gaps.push({ type: 'bull', top: c.low, bottom: a.high, idx: i });
+    else if (c.high < a.low) gaps.push({ type: 'bear', top: a.low, bottom: c.high, idx: i });
+  }
+  return gaps.filter(function (g) {
+    for (var k = g.idx + 1; k < data.length; k++) {
+      if (g.type === 'bull' && data[k].low <= g.bottom) return false;
+      if (g.type === 'bear' && data[k].high >= g.top) return false;
+    }
+    return true;
+  });
+}
+
+// ---------- trend ----------
+function detectTrend(data) {
+  var s20 = sma(data, 20), s50 = sma(data, 50);
+  var last = data[data.length - 1].close;
+  var m20 = s20[s20.length - 1].value, m50 = s50[s50.length - 1].value;
+  var recent = data.slice(-30), half = Math.floor(recent.length / 2);
+  function mx(arr, f) { return Math.max.apply(null, arr.map(f)); }
+  function mn(arr, f) { return Math.min.apply(null, arr.map(f)); }
+  var h1 = mx(recent.slice(0, half), function (x) { return x.high; });
+  var h2 = mx(recent.slice(half), function (x) { return x.high; });
+  var l1 = mn(recent.slice(0, half), function (x) { return x.low; });
+  var l2 = mn(recent.slice(half), function (x) { return x.low; });
+  var pts = 0;
+  if (last > m20) pts++; else pts--;
+  if (m20 > m50) pts++; else pts--;
+  if (h2 > h1 && l2 > l1) pts++;
+  if (h2 < h1 && l2 < l1) pts--;
+  var trend = pts >= 2 ? 'up' : (pts <= -2 ? 'down' : 'side');
+  return { trend: trend, ma20: m20, ma50: m50, s20: s20, s50: s50, last: last };
+}
+
+// ---------- rysowanie i plan ----------
+var lines = [];
+function clearLines() { lines.forEach(function (l) { series.removePriceLine(l); }); lines = []; }
+function addLine(price, color, width, style, title, axis) {
+  lines.push(series.createPriceLine({ price: price, color: color, lineWidth: width, lineStyle: style, axisLabelVisible: axis, title: title }));
+}
+
+function analyze() {
+  var planBox = document.getElementById('plan');
+  clearLines();
+  if (candles.length < 60) { planBox.innerHTML = 'Za mało świec do analizy.'; return; }
+
+  var gaps = findFVGs(candles);
+  var tr = detectTrend(candles);
+  ma20.setData(tr.s20); ma50.setData(tr.s50);
+
+  gaps.filter(function (g) { return g.type === 'bull'; }).slice(-4).concat(
+    gaps.filter(function (g) { return g.type === 'bear'; }).slice(-4)
+  ).forEach(function (g) {
+    var col = g.type === 'bull' ? '#26a69a' : '#ef5350';
+    addLine(g.top, col, 1, 2, g.type === 'bull' ? 'FVG byczy' : 'FVG niedźwiedzi', false);
+    addLine(g.bottom, col, 1, 2, '', false);
+  });
+
+  var label = { up: 'WZROSTOWY', down: 'SPADKOWY', side: 'BOCZNY' }[tr.trend];
+  var html = 'Trend (' + tf.toUpperCase() + '): <b class="' + tr.trend + '">' + label + '</b>' +
+    ' &nbsp;|&nbsp; MA20 ' + tr.ma20.toFixed(2) + ' (żółta), MA50 ' + tr.ma50.toFixed(2) + ' (niebieska)' +
+    ' &nbsp;|&nbsp; Otwarte FVG: ' + gaps.length + '<br>';
+
+  var price = tr.last, buf = 0.5 * atr(candles, 14);
+  var side, entry, sl, tp;
+
+  if (tr.trend === 'side') {
+    html += '<span class="side">Trend boczny: brak czytelnego sygnału. Lepiej poczekać na wybicie.</span>';
+  } else if (tr.trend === 'up') {
+    var bulls = gaps.filter(function (g) { return g.type === 'bull' && g.top < price; });
+    if (!bulls.length) html += '<span class="side">Trend wzrostowy, ale brak byczej luki pod ceną. Czekaj na cofnięcie.</span>';
+    else {
+      var g = bulls[bulls.length - 1];
+      side = 'KUP (LONG)'; entry = g.top; sl = g.bottom - buf;
+      tp = Math.max.apply(null, candles.slice(-60).map(function (x) { return x.high; }));
+      if (tp - entry < 2 * (entry - sl)) tp = entry + 2 * (entry - sl);
+    }
+  } else {
+    var bears = gaps.filter(function (g) { return g.type === 'bear' && g.bottom > price; });
+    if (!bears.length) html += '<span class="side">Trend spadkowy, ale brak niedźwiedziej luki nad ceną. Czekaj na odbicie.</span>';
+    else {
+      var g2 = bears[bears.length - 1];
+      side = 'SPRZEDAJ (SHORT)'; entry = g2.bottom; sl = g2.top + buf;
+      tp = Math.min.apply(null, candles.slice(-60).map(function (x) { return x.low; }));
+      if (entry - tp < 2 * (sl - entry)) tp = entry - 2 * (sl - entry);
+    }
+  }
+
+  if (side) {
+    var rr = (Math.abs(tp - entry) / Math.abs(entry - sl)).toFixed(2);
+    var col = side.indexOf('KUP') === 0 ? '#26a69a' : '#ef5350';
+    addLine(entry, '#ffffff', 2, 0, 'Wejście', true);
+    addLine(sl, '#ef5350', 2, 0, 'SL', true);
+    addLine(tp, '#26a69a', 2, 0, 'TP', true);
+    html += '<h3 style="margin:8px 0 4px">Propozycja: <span style="color:' + col + '">' + side + '</span></h3>' +
+      'Wejście (zlecenie limit): <b>' + entry.toFixed(2) + '</b><br>' +
+      'Stop loss: <b>' + sl.toFixed(2) + '</b><br>' +
+      'Take profit: <b>' + tp.toFixed(2) + '</b><br>' +
+      'Zysk do ryzyka: <b>1:' + rr + '</b><br>' +
+      '<small>Cena teraz: ' + price.toFixed(2) + '. Pomoc w analizie, nie gwarancja.</small>';
+  }
+  planBox.innerHTML = html;
+}
+
+// ---------- ładowanie i odświeżanie ----------
+async function reload(fit) {
+  var st = document.getElementById('status');
+  try {
+    candles = await loadHistory();
+    series.setData(candles);
+    if (fit) chart.timeScale().fitContent();
+    var last = candles[candles.length - 1];
+    document.getElementById('price').textContent = last.close.toFixed(2);
+    st.innerHTML = 'Świec: ' + candles.length + ' (' + tf.toUpperCase() + ', około 2 miesiące). Ostatnia aktualizacja: ' + new Date().toLocaleTimeString('pl-PL') + ' <small>(odświeżanie co minutę)</small>';
+    analyze();
+  } catch (e) {
+    st.innerHTML = 'Nie udało się pobrać danych: ' + e.message + '. Spróbuję znowu za minutę.';
+  }
+}
+
+document.querySelectorAll('header button').forEach(function (b) {
+  b.addEventListener('click', function () {
+    document.querySelectorAll('header button').forEach(function (x) { x.classList.remove('active'); });
+    b.classList.add('active');
+    tf = b.dataset.tf;
+    reload(true);
+  });
+});
+
+reload(true);
+setInterval(function () { reload(false); }, 60000);
+</script>
+</body>
+</html>
